@@ -1,0 +1,11 @@
+{
+  "name": "food-agent-root",
+  "version": "1.0.0",
+  "scripts": {
+    "install:all": "cd backend && npm install && cd ../frontend && npm install",
+    "install:browser": "cd backend && npx playwright install chromium",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "setup": "npm run install:all && npm run install:browser"
+  }
+}
