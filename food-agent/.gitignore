@@ -106,3 +106,18 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Project specific files
+commit.txt
+push_error.txt
+
+# Build outputs
+backend/dist/
+frontend/dist/
+
+# Vite cache
+.vite/
+
+# Package lock files (optional - comment out if you want to track them)
+package-lock.json
+yarn.lock
