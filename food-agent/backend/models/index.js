@@ -21,6 +21,7 @@ const sessionSchema = new mongoose.Schema({
     address: String,
     time: String,
   },
+  latestScreenData: { type: mongoose.Schema.Types.Mixed },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
 });

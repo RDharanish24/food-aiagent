@@ -445,17 +445,27 @@ export class FoodOrderingAgent {
     } catch { return []; }
   }
 
-  async addItemToCart(itemName, quantity = 1, customizations = []) {
+  async addItemToCart(itemName, quantity = 1, customizations = [], restaurantName = null) {
     try {
-      const locators = [
-        `[data-testid="normal-dish-item"]:has-text("${itemName}")`,
-        `[class*="MenuItem"]:has-text("${itemName}")`,
-        `[class*="DishInfo"]:has-text("${itemName}")`,
-      ];
+      if (restaurantName) {
+        const restSelectors = ['[data-testid="restaurant-item"]', '[class*="RestaurantCard"]', 'a[href*="/city/"]', '[class*="Restaurant_"]'];
+        for (const rSel of restSelectors) {
+          try {
+            const card = this.page.locator(rSel, { hasText: new RegExp(restaurantName, 'i') }).first();
+            if (await card.isVisible({ timeout: 1500 })) {
+              await card.click();
+              await this.page.waitForTimeout(3500); // Wait for menu to load
+              break;
+            }
+          } catch { continue; }
+        }
+      }
+
+      const locators = ['[data-testid="normal-dish-item"]', '[class*="MenuItem"]', '[class*="DishInfo"]'];
       let itemEl = null;
       for (const loc of locators) {
         try {
-          const el = this.page.locator(loc).first();
+          const el = this.page.locator(loc, { hasText: new RegExp(itemName, 'i') }).first();
           if (await el.isVisible({ timeout: 3000 })) { itemEl = el; break; }
         } catch { continue; }
       }
@@ -465,11 +475,26 @@ export class FoodOrderingAgent {
       if (isOOS) return { success: false, error: `"${itemName}" is out of stock`, outOfStock: true };
 
       let added = false;
-      for (const sel of ['[data-testid="add-to-cart"]', 'button:has-text("ADD")', 'button:has-text("Add")', '[class*="addBtn"]']) {
+      for (const sel of ['[data-testid="add-to-cart"]', 'button:has-text("ADD")', 'button:has-text("Add")', '[class*="addBtn"]', 'button:has-text("+")']) {
         try {
           const btn = itemEl.locator(sel).first();
-          if (await btn.isVisible({ timeout: 2000 })) { await btn.click(); added = true; await this.page.waitForTimeout(800); break; }
+          if (await btn.isVisible({ timeout: 1500 })) { await btn.click({ force: true }); added = true; await this.page.waitForTimeout(800); break; }
         } catch { continue; }
+      }
+
+      // Fallback self-healing element locator
+      if (!added) {
+        try {
+          const anyButton = itemEl.locator('button').first();
+          if (await anyButton.isVisible({ timeout: 1000 })) {
+             await anyButton.click({ force: true });
+             added = true;
+          } else {
+             await itemEl.click({ force: true }); // Click whole block if nothing else matches
+             added = true;
+          }
+          await this.page.waitForTimeout(800);
+        } catch { }
       }
 
       await this._handleCustomizationModal(customizations);

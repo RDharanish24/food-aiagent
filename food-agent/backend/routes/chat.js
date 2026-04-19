@@ -22,13 +22,20 @@ router.post('/', async (req, res) => {
 
     conversation.messages.push({ role: 'user', content: message });
 
-    const intentData = await extractIntent(message, conversation.messages.slice(-8));
+    const intentData = await extractIntent(message, conversation.messages.slice(-8), session.latestScreenData);
 
     let reply = '';
     let agentResult = null;
     let screenshotBase64 = null;
     let cartUpdated = false;
     let searchResults = null;
+
+    if (intentData.clarificationNeeded) {
+      reply = intentData.clarificationQuestion;
+      conversation.messages.push({ role: 'assistant', content: reply });
+      await conversation.save();
+      return res.json({ sessionId, reply, cart: session.cart, status: session.status, intent: intentData.intent });
+    }
 
     switch (intentData.intent) {
       case 'greet':
@@ -127,6 +134,7 @@ router.post('/', async (req, res) => {
         const result = await agent.searchFood(query);
         screenshotBase64 = result.screenshot;
         searchResults = result.results;
+        session.latestScreenData = result.results;
 
         if (result.results?.length > 0) {
           reply = `🔍 Found **${result.results.length} results** for "${query}" on Swiggy! Tap a restaurant to open its menu, or say "add [item name]" to order.`;
@@ -148,7 +156,7 @@ router.post('/', async (req, res) => {
 
         const results = [];
         for (const item of intentData.items) {
-          const r = await agent.addItemToCart(item.name, item.quantity || 1, item.customizations || []);
+          const r = await agent.addItemToCart(item.name, item.quantity || 1, item.customizations || [], item.restaurantName);
           results.push({ item: item.name, ...r });
           if (r.success) {
             session.cart.push({ itemName: item.name, quantity: item.quantity || 1, customizations: item.customizations || [], price: null, itemId: uuidv4() });
@@ -278,6 +286,9 @@ router.post('/navigate', async (req, res) => {
     const agent = getAgent(sessionId);
     if (!agent) return res.status(400).json({ error: 'Session not found' });
     const result = await agent.navigateToRestaurant(url);
+    if (result.success && result.menuItems) {
+      await Session.findOneAndUpdate({ sessionId }, { latestScreenData: result.menuItems });
+    }
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
