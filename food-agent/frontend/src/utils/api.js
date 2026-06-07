@@ -17,4 +17,11 @@ export const navigateToRestaurant = (sessionId, url) =>
 export const getSession = (sessionId) =>
   api.get(`/chat/session/${sessionId}`).then(r => r.data);
 
+export const getOrderState = (sessionId) =>
+  api.get(`/chat/order-state/${sessionId}`).then(r => r.data);
+
+export const resetOrderState = (sessionId) =>
+  api.post('/chat/reset-order', { sessionId }).then(r => r.data);
+
 export default api;
+

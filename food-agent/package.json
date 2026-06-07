@@ -2,9 +2,9 @@
   "name": "food-agent-root",
   "version": "1.0.0",
   "scripts": {
-    "install:all": "cd backend && npm install && cd ../frontend && npm install",
-    "install:browser": "cd backend && npx playwright install chromium",
-    "dev:backend": "cd backend && npm run dev",
+    "install:all": "cd backend && python -m pip install -r requirements.txt && cd ../frontend && npm install",
+    "install:browser": "cd backend && python -m playwright install chromium",
+    "dev:backend": "cd backend && python -m uvicorn main:app --reload --port 8000",
     "dev:frontend": "cd frontend && npm run dev",
     "setup": "npm run install:all && npm run install:browser"
   }
