@@ -58,13 +58,12 @@ async def chat_endpoint(req: ChatRequest):
         screenshot_base64 = None
         cart_updated = False
         search_results = None
-        agent_result = None
 
         # Persist updated order state
         session_data["orderState"] = orchestrator_result.get("orderState")
 
         # ══════════════════════════════════════════════════════════════════════
-        # PHASE 2: If orchestrator emits a complete payload → dispatch to agent
+        # PHASE 2: BROWSER EXECUTION WORKER
         # ══════════════════════════════════════════════════════════════════════
         is_complete = orchestrator_result.get("isComplete")
         final_payload = orchestrator_result.get("finalPayload")
@@ -78,108 +77,58 @@ async def chat_endpoint(req: ChatRequest):
                 intent = final_payload.get("intent")
                 data = final_payload.get("data", {})
                 
-                # ── SEARCH_AND_ADD ──────────────────────────────────────────────
+                # Update reply to indicate action starting
                 if intent == "SEARCH_AND_ADD":
-                    search_query = data.get("restaurant_preference") or (data.get("items")[0].get("name") if data.get("items") else None) or req.message
-                    reply = f"🔍 Searching Swiggy for **\"{search_query}\"**...\n\n"
-                    
-                    search_res = await agent.search_food(search_query)
-                    screenshot_base64 = search_res.get("screenshot")
-                    search_results = search_res.get("results")
-                    session_data["latestScreenData"] = search_results
-
-                    if not search_res.get("success") or not search_results:
-                        reply += f"😕 No results found for \"{search_query}\". Try a different name!"
-                    else:
-                        reply += f"Found **{len(search_results)} results**!"
-
-                        if data.get("restaurant_preference"):
-                            target_restaurant = next((r for r in search_results if r.get("type") == "restaurant" and r.get("url")), None)
-                            if target_restaurant:
-                                nav_res = await agent.navigate_to_restaurant(target_restaurant["url"])
-                                if nav_res.get("success"):
-                                    add_results = []
-                                    for item in data.get("items", []):
-                                        add_res = await agent.add_item_to_cart(
-                                            item.get("name"),
-                                            item.get("quantity", 1),
-                                            item.get("customizations", [])
-                                        )
-                                        add_results.append({"item": item.get("name"), **add_res})
-                                        if add_res.get("success"):
-                                            session_data["cart"].append(CartItem(
-                                                itemName=item.get("name"),
-                                                quantity=item.get("quantity", 1),
-                                                customizations=item.get("customizations", []),
-                                                price=None,
-                                                itemId=str(uuid.uuid4())
-                                            ).model_dump())
-                                            screenshot_base64 = add_res.get("screenshot")
-
-                                    ok_items = [r["item"] for r in add_results if r.get("success")]
-                                    failed_items = [r["item"] for r in add_results if not r.get("success")]
-
-                                    if ok_items:
-                                        reply = f"✅ Added **{', '.join(ok_items)}** to your cart from **{data.get('restaurant_preference')}**!"
-                                        cart_updated = True
-                                        session_data["status"] = "ordering"
-                                    if failed_items:
-                                        reply += f"\n⚠️ Couldn't find: **{', '.join(failed_items)}**"
-                                else:
-                                    reply += "\n❌ Couldn't open restaurant menu."
-                                    screenshot_base64 = nav_res.get("screenshot")
-                            else:
-                                reply += f"\n❌ Could not find a link for **{data.get('restaurant_preference')}**."
-                        else:
-                            reply += " Tap a restaurant to open its menu, or tell me which one you prefer!"
-                            agent_result = {"type": "search", "results": search_results}
-
-                # ── MODIFY_CART ─────────────────────────────────────────────────
+                    reply = f"🔍 Launching execution worker for **{data.get('restaurant_preference') or 'your items'}**...\n\n"
                 elif intent == "MODIFY_CART":
-                    mod_results = []
-                    for item in data.get("items", []):
-                        if item.get("action") == "remove" or item.get("quantity") == 0:
-                            session_data["cart"] = [c for c in session_data["cart"] if c.get("itemName").lower() != item.get("name").lower()]
-                            mod_results.append({"item": item.get("name"), "action": "removed"})
-                        else:
-                            existing = next((c for c in session_data["cart"] if c.get("itemName").lower() == item.get("name").lower()), None)
-                            if existing:
-                                existing["quantity"] = item.get("quantity") or existing.get("quantity")
-                                if item.get("customizations"):
-                                    existing["customizations"] = item.get("customizations")
-                                mod_results.append({"item": item.get("name"), "action": "updated"})
-
-                    cart_updated = len(mod_results) > 0
-                    if mod_results:
-                        summary = "\n".join([f"• **{r['item']}** → {r['action']}" for r in mod_results])
-                        reply = f"🛒 Cart updated!\n\n{summary}"
-                    else:
-                        reply = "Hmm, I couldn't find those items in your cart. Check what's there with \"show cart\"."
-
-                # ── PLACE_ORDER ──────────────────────────────────────────────────
+                    reply = f"🛒 Launching execution worker to modify cart...\n\n"
                 elif intent == "PLACE_ORDER":
-                    if not session_data.get("cart"):
-                        reply = "Your cart is empty! Add some items first. 🍽️"
-                    else:
-                        confirm_msg = await generate_confirmation_message(session_data["cart"], session_data.get("deliveryDetails"))
-                        reply = confirm_msg
-                        session_data["status"] = "confirming"
+                    reply = f"✅ Launching execution worker for checkout...\n\n"
 
-                        checkout = await agent.proceed_to_checkout()
-                        screenshot_base64 = checkout.get("screenshot")
+                # Delegate the entire intent payload to the encapsulated Browser Execution Worker
+                worker_response = await agent.execute_intent(final_payload)
+                
+                status = worker_response.get("status")
+                current_cart = worker_response.get("current_cart", [])
+                screenshot_base64 = worker_response.get("screenshot_path")
+                error_message = worker_response.get("error_message")
 
-                        if checkout.get("success"):
-                            order_logs_coll = get_order_logs_collection()
-                            await order_logs_coll.insert_one(OrderLogDoc(
-                                sessionId=session_id,
-                                items=[CartItem(**c) for c in session_data["cart"]],
-                                status="placed",
-                                agentActions=agent.action_log
-                            ).model_dump())
-                            
-                            session_data["status"] = "completed"
-                            reply += "\n\n✅ **Order placed!** You'll get a confirmation on your Swiggy app."
-                            session_data["orderState"] = Orchestrator.reset_state()
+                # Update the session cart
+                if current_cart is not None:
+                    # Convert to DB models
+                    session_data["cart"] = []
+                    for item in current_cart:
+                        session_data["cart"].append(CartItem(
+                            itemName=item.get("name"),
+                            quantity=item.get("quantity", 1),
+                            price=item.get("price"),
+                            itemId=str(uuid.uuid4())
+                        ).model_dump())
+                    cart_updated = True
+
+                # Process the outcome
+                if status == "SUCCESS":
+                    if intent == "SEARCH_AND_ADD":
+                        added_names = ", ".join([i.get("name") for i in data.get("items", [])])
+                        reply += f"✅ Successfully completed search and add for: **{added_names}**"
+                        session_data["status"] = "ordering"
+                    elif intent == "MODIFY_CART":
+                        reply += "✅ Cart modifications successful!"
+                    elif intent == "PLACE_ORDER":
+                        reply += "🎉 Order placed successfully! You will receive confirmation on Swiggy."
+                        session_data["status"] = "completed"
+                        session_data["orderState"] = Orchestrator.reset_state()
+                        
+                        # Log order
+                        order_logs_coll = get_order_logs_collection()
+                        await order_logs_coll.insert_one(OrderLogDoc(
+                            sessionId=session_id,
+                            items=[CartItem(**c) for c in session_data["cart"]],
+                            status="placed",
+                            agentActions=agent.action_log
+                        ).model_dump())
+                else:
+                    reply += f"❌ Execution Worker Failed: {error_message}"
 
         # ── Persist & respond ──
         session_data["updatedAt"] = datetime.utcnow()
