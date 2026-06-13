@@ -107,6 +107,22 @@ Thumbs.db
 *.swp
 *.swo
 
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.python-version
+venv/
+ENV/
+env/
+.venv/
+
+# Browser debug/profile directories
+debug_profile/
+tmp_debug_profile/
+
 # Project specific files
 commit.txt
 push_error.txt

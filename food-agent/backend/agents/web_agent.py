@@ -2,16 +2,23 @@ import time
 import base64
 import urllib.parse
 import re
+import os
+import json
+import shutil
 from datetime import datetime
 from playwright.async_api import async_playwright, Page, BrowserContext, Browser
-from playwright_stealth import stealth
+from playwright_stealth import Stealth
 
 BASE_URL = 'https://www.swiggy.com'
+
+# Default geolocation: Bangalore
+DEFAULT_LAT = '12.9716'
+DEFAULT_LNG = '77.5946'
+DEFAULT_ADDRESS = 'Bangalore, Karnataka, India'
 
 class FoodOrderingAgent:
     def __init__(self, session_id: str):
         self.session_id = session_id
-        self.browser: Browser = None
         self.context: BrowserContext = None
         self.page: Page = None
         self.action_log = []
@@ -26,32 +33,39 @@ class FoodOrderingAgent:
 
     async def init(self):
         self._playwright = await async_playwright().start()
-        # Launching headless=True as requested for execution worker, using stealth
-        self.browser = await self._playwright.chromium.launch(
+        
+        # Define persistent profile path
+        self.profile_dir = os.path.join(os.getcwd(), f"tmp_playwright_profile_{self.session_id}")
+        os.makedirs(self.profile_dir, exist_ok=True)
+        
+        # Launch persistent context for stealth and session retention
+        self.context = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=self.profile_dir,
             headless=True,
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-blink-features=AutomationControlled',
                 '--window-size=1920,1080',
-            ]
-        )
-        
-        self.context = await self.browser.new_context(
+            ],
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080},
             locale='en-IN',
             timezone_id='Asia/Kolkata',
             permissions=['geolocation'],
-            color_scheme='dark'
+            geolocation={'latitude': float(DEFAULT_LAT), 'longitude': float(DEFAULT_LNG)},
+            color_scheme='light'
         )
         
-        self.page = await self.context.new_page()
+        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         
         # Apply playwright-stealth to evade bot detection
-        await stealth(self.page)
+        await Stealth().apply_stealth_async(self.page)
+        
+        # Set location cookies so Swiggy knows our delivery area
+        await self._set_location_cookies(DEFAULT_LAT, DEFAULT_LNG, DEFAULT_ADDRESS)
 
-        self.log('init', 'browser', 'stealth initialized')
+        self.log('init', 'browser', 'stealth persistent context initialized')
 
     # ─────────────────────────────────────────────────────────────────────────
     # BROWSER EXECUTION WORKER: SINGLE ENTRY POINT
@@ -102,6 +116,170 @@ class FoodOrderingAgent:
     # INTENT HANDLERS
     # ─────────────────────────────────────────────────────────────────────────
 
+    async def _set_location_cookies(self, lat: str, lng: str, address: str):
+        """
+        Sets Swiggy location cookies directly. This is the most reliable way
+        to tell Swiggy's SPA our delivery location without fragile UI interaction.
+        """
+        await self.context.add_cookies([
+            {"name": "lat", "value": lat, "domain": ".swiggy.com", "path": "/"},
+            {"name": "lng", "value": lng, "domain": ".swiggy.com", "path": "/"},
+            {
+                "name": "userLocation",
+                "value": json.dumps({
+                    "lat": lat, "lng": lng,
+                    "address": address, "id": "", "annotation": address.split(',')[0]
+                }),
+                "domain": ".swiggy.com", "path": "/"
+            },
+        ])
+        self.log("location_cookies", "set", f"{address} ({lat}, {lng})")
+
+    async def _ensure_location_set(self) -> bool:
+        """
+        Ensures location cookies are set. Uses cookie-based approach as primary,
+        falling back to UI interaction if needed.
+        """
+        try:
+            self.log("location_check", "started", f"Page URL: {self.page.url}")
+            
+            # Check if location cookies already exist
+            cookies = await self.context.cookies("https://www.swiggy.com")
+            has_lat = any(c['name'] == 'lat' and c['value'] for c in cookies)
+            has_lng = any(c['name'] == 'lng' and c['value'] for c in cookies)
+            
+            if has_lat and has_lng:
+                self.log("location_check", "cookies_present", "Location already set via cookies")
+                return True
+            
+            # Set cookies if missing
+            await self._set_location_cookies(DEFAULT_LAT, DEFAULT_LNG, DEFAULT_ADDRESS)
+            return True
+        except Exception as e:
+            self.log("location", "Error setting location", str(e))
+            # Last resort: set cookies anyway
+            try:
+                await self._set_location_cookies(DEFAULT_LAT, DEFAULT_LNG, DEFAULT_ADDRESS)
+                return True
+            except:
+                return False
+
+    async def _search_item_or_restaurant(self, query: str, is_dish: bool = True) -> bool:
+        """
+        Navigates to /search, types the query using character-by-character input
+        (to trigger React autocomplete), clicks the best suggestion, and waits
+        for actual results to load past skeleton state.
+        """
+        try:
+            # Navigate to search page
+            if "/search" not in self.page.url or "query=" in self.page.url:
+                try:
+                    await self.page.goto(f"{BASE_URL}/search", wait_until='domcontentloaded', timeout=20000)
+                except Exception as e:
+                    self.log("goto_search", "warning", f"Search page navigation: {e}")
+            
+            # Wait for search input to become visible
+            try:
+                await self.page.wait_for_selector(
+                    'input[placeholder*="Search for"]', state='visible', timeout=15000
+                )
+            except:
+                self.log("search", "warning", "Search input not found after wait, retrying...")
+                await self.page.wait_for_timeout(3000)
+            
+            # Find the search input
+            search_input = None
+            for sel in ['input[placeholder*="Search for"]', 'input[placeholder*="search" i]', 'input[type="text"]']:
+                el = self.page.locator(sel).first
+                if await el.is_visible(timeout=2000):
+                    search_input = el
+                    break
+                    
+            if not search_input:
+                self.log("search", "error", "Search input not found on page")
+                return False
+            
+            # Clear and type query character-by-character (triggers React onChange)
+            await search_input.click()
+            await search_input.focus()
+            # Triple-click to select all, then delete
+            await search_input.click(click_count=3)
+            await self.page.keyboard.press('Backspace')
+            await self.page.wait_for_timeout(300)
+            await search_input.type(query, delay=80)
+            self.log("search", "typed_query", query)
+            
+            # Wait for autocomplete suggestions to appear
+            try:
+                await self.page.wait_for_selector('button.xN32R', state='visible', timeout=8000)
+                self.log("search", "suggestions", "Autocomplete suggestions appeared")
+            except:
+                self.log("search", "warning", "No autocomplete suggestions, pressing Enter")
+                await search_input.press('Enter')
+                await self._wait_for_search_results()
+                return True
+            
+            # Click the best matching suggestion
+            suggestion_clicked = False
+            suggestion_buttons = await self.page.locator('button.xN32R').all()
+            
+            # Prefer "Dish" type suggestions for dish searches, "Restaurant" for restaurant searches
+            prefer_type = "Dish" if is_dish else "Restaurant"
+            
+            for btn in suggestion_buttons:
+                try:
+                    text = await btn.text_content()
+                    if not text:
+                        continue
+                    text = text.strip()
+                    
+                    # Check if this suggestion matches our query and preferred type
+                    if query.lower() in text.lower() and prefer_type in text:
+                        self.log("search", "clicking_suggestion", text)
+                        await btn.click()
+                        suggestion_clicked = True
+                        break
+                except:
+                    continue
+            
+            # Fallback: click first suggestion if no preferred match found
+            if not suggestion_clicked:
+                first_btn = self.page.locator('button.xN32R').first
+                if await first_btn.is_visible(timeout=2000):
+                    text = await first_btn.text_content()
+                    self.log("search", "clicking_first_suggestion", text.strip() if text else "unknown")
+                    await first_btn.click()
+                    suggestion_clicked = True
+            
+            if not suggestion_clicked:
+                # Final fallback: press Enter
+                await search_input.press('Enter')
+            
+            # Wait for actual results to load (past skeleton placeholders)
+            await self._wait_for_search_results()
+            return True
+            
+        except Exception as e:
+            self.log("search", "error", str(e))
+            return False
+    
+    async def _wait_for_search_results(self):
+        """
+        Waits for search results to fully render by checking for the rupee symbol
+        in the page text, which indicates prices have loaded past the skeleton state.
+        """
+        try:
+            await self.page.wait_for_function(
+                "() => document.body.innerText.includes('\u20B9')",
+                timeout=25000
+            )
+            self.log("search", "results_loaded", "Content rendered (prices visible)")
+        except:
+            self.log("search", "warning", "Timeout waiting for results content")
+        
+        # Extra buffer for remaining content to load
+        await self.page.wait_for_timeout(2000)
+
     async def _handle_search_and_add(self, data: dict) -> dict:
         restaurant = data.get("restaurant_preference")
         items = data.get("items", [])
@@ -109,47 +287,120 @@ class FoodOrderingAgent:
         if not items:
             return self._create_response("FAILED", "No items provided to search and add.")
             
-        await self.page.goto(BASE_URL, wait_until='domcontentloaded', timeout=40000)
-        await self.page.wait_for_timeout(2000)
+        # Get current cart contents to avoid double-ordering
+        cart_data = await self.get_cart_contents()
+        existing_cart_items = cart_data.get("items", []) if cart_data.get("success") else []
+        existing_item_names = {item["name"].lower() for item in existing_cart_items}
+        self.log("cart_check", "existing_cart_items", str(existing_item_names))
+
+        # Ensure location cookies are set
+        await self._ensure_location_set()
 
         added_items_log = []
+        menu_search_selectors = [
+            'input[placeholder*="Search for dishes"]',
+            'input[placeholder*="Search in menu"]',
+            'input[placeholder*="search" i]',
+            'input[class*="search" i]',
+            '[data-testid="menu-search"] input'
+        ]
         
         # Scenario A: Restaurant specified
         if restaurant:
             self.log("execute", "search_restaurant", restaurant)
-            url = f"{BASE_URL}/search?query={urllib.parse.quote(restaurant)}"
-            await self.page.goto(url, wait_until='domcontentloaded')
-            await self.page.wait_for_timeout(3000)
+            await self._search_item_or_restaurant(restaurant, is_dish=False)
             
-            # Find and click the restaurant card
-            card = self.page.locator(
-                f'[data-testid="restaurant-item"]:has-text("{restaurant}"), [class*="RestaurantCard"]:has-text("{restaurant}")'
-            ).first
+            # Find and click the restaurant link/card
+            # Swiggy search results use <a> tags with class _3VPpz for restaurant links
+            clicked = False
+            restaurant_link_selectors = [
+                'a._3VPpz',  # Swiggy's actual restaurant link class
+                'a[href*="/city/"]',
+                'a[href*="/restaurant"]',
+                '[data-testid="restaurant-item"]',
+            ]
+            for sel in restaurant_link_selectors:
+                elements = await self.page.locator(sel).all()
+                for el in elements:
+                    try:
+                        text = await el.text_content()
+                        if text and restaurant.lower() in text.lower():
+                            await el.scroll_into_view_if_needed()
+                            await el.click()
+                            clicked = True
+                            self.log("restaurant", "clicked", text.strip()[:100])
+                            break
+                    except:
+                        continue
+                if clicked:
+                    break
             
-            if await card.is_visible():
-                await card.click()
-                await self.page.wait_for_timeout(4000)
+            if not clicked:
+                # Click the first restaurant result as fallback
+                first_link = self.page.locator('a._3VPpz, a[href*="/city/"]').first
+                if await first_link.is_visible(timeout=3000):
+                    await first_link.click()
+                    clicked = True
+            
+            if clicked:
+                await self.page.wait_for_timeout(5000)
             else:
                 screenshot = await self.take_screenshot()
                 return self._create_response("FAILED", f"Could not find restaurant: {restaurant}", screenshot)
                 
             # Add items from restaurant menu
             for item in items:
-                res = await self._add_item_robust(item.get("name"), item.get("quantity", 1), item.get("customizations", []))
-                if res: added_items_log.append(item.get("name"))
+                item_name = item.get("name")
+                
+                if self._is_item_in_cart(item_name, existing_item_names):
+                    self.log("add_item", item_name, "Already in cart, skipping")
+                    added_items_log.append(item_name)
+                    continue
+                
+                # Search the item inside restaurant menu
+                menu_search_input = None
+                for sel in menu_search_selectors:
+                    el = self.page.locator(sel).first
+                    if await el.is_visible(timeout=1000):
+                        menu_search_input = el
+                        break
+                
+                if menu_search_input:
+                    self.log("menu_search", f"Searching menu for {item_name}", "")
+                    await menu_search_input.click()
+                    await menu_search_input.click(click_count=3)
+                    await self.page.keyboard.press('Backspace')
+                    await menu_search_input.type(item_name, delay=80)
+                    await self.page.wait_for_timeout(2000)
+                
+                res = await self._add_item_robust(item_name, item.get("quantity", 1), item.get("customizations", []))
+                if res:
+                    added_items_log.append(item_name)
+                    existing_item_names.add(item_name.lower())
 
         # Scenario B: No Restaurant (Global dish search)
         else:
             for item in items:
                 dish_name = item.get("name")
-                self.log("execute", "global_search_dish", dish_name)
-                url = f"{BASE_URL}/search?query={urllib.parse.quote(dish_name)}"
-                await self.page.goto(url, wait_until='domcontentloaded')
-                await self.page.wait_for_timeout(3000)
                 
-                # We are looking at a dish search results page
-                res = await self._add_item_robust(dish_name, item.get("quantity", 1), item.get("customizations", []))
-                if res: added_items_log.append(dish_name)
+                if self._is_item_in_cart(dish_name, existing_item_names):
+                    self.log("add_item", dish_name, "Already in cart, skipping")
+                    added_items_log.append(dish_name)
+                    continue
+                
+                self.log("execute", "global_search_dish", dish_name)
+                await self._search_item_or_restaurant(dish_name, is_dish=True)
+                
+                # On the search results page, dish cards are directly visible with ADD buttons.
+                # Use [data-testid="search-pl-dish-first-v2-card"] as the outer card container
+                # and [data-testid="normal-dish-item"] as the inner dish item.
+                # We can add directly from the search results page!
+                res = await self._add_item_robust(
+                    dish_name, item.get("quantity", 1), item.get("customizations", [])
+                )
+                if res:
+                    added_items_log.append(dish_name)
+                    existing_item_names.add(dish_name.lower())
 
         # Sync cart state after all adds
         cart_data = await self.get_cart_contents()
@@ -159,6 +410,13 @@ class FoodOrderingAgent:
             return self._create_response("FAILED", "Could not add any of the requested items.", screenshot, cart_data.get("items", []))
             
         return self._create_response("SUCCESS", None, screenshot, cart_data.get("items", []))
+    
+    def _is_item_in_cart(self, item_name: str, existing_item_names: set) -> bool:
+        """Check if an item is already in the cart (fuzzy name match)."""
+        for existing_name in existing_item_names:
+            if item_name.lower() in existing_name or existing_name in item_name.lower():
+                return True
+        return False
 
     async def _handle_modify_cart(self, data: dict) -> dict:
         items = data.get("items", [])
@@ -231,70 +489,138 @@ class FoodOrderingAgent:
         """
         Locates the specific item container semantically, checks for Out of Stock,
         and clicks the 'ADD' button strictly scoped inside that container.
+        
+        Swiggy DOM structure (from real analysis):
+        - Outer card: [data-testid="search-pl-dish-first-v2-card"] (class: _1K_JA _3Y0kn)
+        - Inner dish: [data-testid="normal-dish-item"] (class: sc-tagGq dqUmYU)
+        - ADD button: button with class containing 'add-button-center-container'
+        - Restaurant link: a._3VPpz
         """
         try:
-            # 1. Locate the container
-            container_selectors = ['[data-testid="normal-dish-item"]', '[class*="MenuItem"]', '[class*="DishCard"]']
+            # 1. Locate the dish container
+            # Use multiple selectors, ordered by specificity for Swiggy's real DOM
+            container_selectors = [
+                '[data-testid="normal-dish-item"]',
+                '[data-testid="search-pl-dish-first-v2-card"]',
+                '[class*="MenuItem"]',
+                '[class*="DishCard"]',
+            ]
             item_container = None
             
             for sel in container_selectors:
-                # Use robust regex match for item name inside the container
+                # Use case-insensitive regex match for item name inside the container
                 el = self.page.locator(sel, has_text=re.compile(re.escape(item_name), re.IGNORECASE)).first
-                if await el.is_visible(timeout=2000):
-                    item_container = el
-                    break
+                try:
+                    if await el.is_visible(timeout=3000):
+                        item_container = el
+                        self.log("add_item", item_name, f"Container found with: {sel}")
+                        break
+                except:
+                    continue
             
             if not item_container:
-                self.log("add_item", item_name, "Container not found")
-                return False
+                self.log("add_item", item_name, "Container not found, trying scroll...")
+                # Try scrolling down to find the item
+                for _ in range(3):
+                    await self.page.evaluate("window.scrollBy(0, 600)")
+                    await self.page.wait_for_timeout(1000)
+                    for sel in container_selectors:
+                        el = self.page.locator(sel, has_text=re.compile(re.escape(item_name), re.IGNORECASE)).first
+                        try:
+                            if await el.is_visible(timeout=1000):
+                                item_container = el
+                                break
+                        except:
+                            continue
+                    if item_container:
+                        break
+                
+                if not item_container:
+                    self.log("add_item", item_name, "Container not found after scroll")
+                    return False
 
-            # 2. Check OOS
-            if await item_container.locator('[class*="OutOfStock"],[class*="outOfStock"]').count() > 0:
-                self.log("add_item", item_name, "Out of stock")
-                return False
+            # 2. Check OOS (Out of Stock)
+            try:
+                oos_count = await item_container.locator('[class*="OutOfStock" i]').count()
+                if oos_count > 0:
+                    self.log("add_item", item_name, "Out of stock")
+                    return False
+            except:
+                pass
 
-            # 3. Scoped ADD click
-            add_selectors = ['[data-testid="add-to-cart"]', 'button:has-text("ADD")', 'button:has-text("Add")', '[class*="addBtn"]']
+            # 3. Scroll container into view
+            try:
+                await item_container.scroll_into_view_if_needed()
+                await self.page.wait_for_timeout(500)
+            except:
+                pass
+
+            # 4. Click ADD button (scoped inside the container)
+            # Swiggy uses both "ADD" and "Add" text, and styled-components classes
+            add_selectors = [
+                'button.add-button-center-container',
+                'button:has-text("ADD")',
+                'button:has-text("Add")',
+                '[data-testid="add-to-cart"]',
+                '[class*="addBtn"]',
+            ]
             added = False
             
             for sel in add_selectors:
-                btn = item_container.locator(sel).first
-                if await btn.is_visible(timeout=1000):
-                    await btn.click(force=True)
-                    added = True
-                    await self.page.wait_for_timeout(1000)
-                    break
+                try:
+                    btn = item_container.locator(sel).first
+                    if await btn.is_visible(timeout=1500):
+                        await btn.scroll_into_view_if_needed()
+                        await self.page.wait_for_timeout(300)
+                        await btn.click(force=True)
+                        added = True
+                        self.log("add_item", item_name, f"Clicked ADD via: {sel}")
+                        await self.page.wait_for_timeout(1500)
+                        break
+                except:
+                    continue
                     
             if not added:
-                # Fallback: click the whole container or generic button
+                # Fallback: try any button inside the container
                 try:
-                    any_btn = item_container.locator('button').first
-                    if await any_btn.is_visible(timeout=1000):
-                        await any_btn.click(force=True)
-                        added = True
-                        await self.page.wait_for_timeout(1000)
+                    buttons = await item_container.locator('button').all()
+                    for btn in buttons:
+                        btn_text = await btn.text_content()
+                        if btn_text and btn_text.strip().upper() in ('ADD', 'ADD +'):
+                            await btn.click(force=True)
+                            added = True
+                            self.log("add_item", item_name, "Clicked ADD via button text fallback")
+                            await self.page.wait_for_timeout(1500)
+                            break
                 except:
                     pass
 
             if not added:
-                self.log("add_item", item_name, "Could not find add button inside container")
+                self.log("add_item", item_name, "Could not find ADD button inside container")
                 return False
 
-            # 4. Handle Modals and Quantity
+            # 5. Handle customization modal (if it appears)
             await self._handle_customization_modal(customizations)
             
-            # If qty > 1, we must click the scoped "+" button
+            # 6. Handle quantity (if qty > 1, click "+" button)
             if quantity > 1:
                 for _ in range(1, quantity):
-                    plus_selectors = ['[data-testid="increase-count"]', '[class*="increaseCount"]', 'button:has-text("+")']
+                    plus_selectors = [
+                        '[data-testid="increase-count"]',
+                        '[class*="increaseCount"]',
+                        'button:has-text("+")',
+                    ]
                     for sel in plus_selectors:
-                        plus_btn = item_container.locator(sel).last
-                        if await plus_btn.is_visible(timeout=1000):
-                            await plus_btn.click()
-                            await self.page.wait_for_timeout(500)
-                            break
+                        try:
+                            plus_btn = item_container.locator(sel).last
+                            if await plus_btn.is_visible(timeout=1500):
+                                await plus_btn.click()
+                                await self.page.wait_for_timeout(500)
+                                break
+                        except:
+                            continue
                             
-            self.log("add_item", item_name, "SUCCESS")
+            self.log("add_item", item_name, f"SUCCESS (qty={quantity})")
             return True
 
         except Exception as e:
@@ -328,20 +654,29 @@ class FoodOrderingAgent:
             pass
 
     async def get_cart_contents(self) -> dict:
+        """Navigate to cart page and extract cart items from the DOM."""
         try:
-            await self.page.goto(f"{BASE_URL}/cart", wait_until='domcontentloaded', timeout=15000)
-            await self.page.wait_for_timeout(2000)
+            try:
+                await self.page.goto(f"{BASE_URL}/cart", wait_until='domcontentloaded', timeout=15000)
+            except Exception as e:
+                self.log("goto_cart", "warning", f"Cart page navigation: {e}")
+            await self.page.wait_for_timeout(3000)
             
             js_code = """
                 () => {
                     const items = [];
-                    document.querySelectorAll('[class*="CartItem"],[class*="cartItem"]').forEach(el => {
-                        const name = (el.querySelector('[class*="name"]') || el.querySelector('h4'))?.textContent?.trim();
-                        const qty = el.querySelector('[class*="count"],[class*="quantity"]')?.textContent?.trim() || '1';
-                        const price = el.querySelector('[class*="price"]')?.textContent?.trim();
-                        if (name) items.push({ name, quantity: parseInt(qty) || 1, price });
-                    });
-                    const total = document.querySelector('[class*="TotalPayable"],[class*="grandTotal"]')?.textContent?.trim();
+                    // Try multiple cart item selectors
+                    const selectors = ['[class*="CartItem"]', '[class*="cartItem"]', '[class*="itemContainer"]'];
+                    for (const sel of selectors) {
+                        document.querySelectorAll(sel).forEach(el => {
+                            const name = (el.querySelector('[class*="name" i]') || el.querySelector('h4') || el.querySelector('h3'))?.textContent?.trim();
+                            const qty = el.querySelector('[class*="count" i],[class*="quantity" i]')?.textContent?.trim() || '1';
+                            const price = el.querySelector('[class*="price" i]')?.textContent?.trim();
+                            if (name) items.push({ name, quantity: parseInt(qty) || 1, price });
+                        });
+                        if (items.length > 0) break;
+                    }
+                    const total = document.querySelector('[class*="TotalPayable" i],[class*="grandTotal" i],[class*="totalAmount" i]')?.textContent?.trim();
                     return { items, total };
                 }
             """
@@ -515,10 +850,16 @@ class FoodOrderingAgent:
             return None
 
     async def close(self):
-        if self.browser:
-            await self.browser.close()
+        if self.context:
+            await self.context.close()
         if self._playwright:
             await self._playwright.stop()
+        # Clean up persistent profile directory
+        if hasattr(self, 'profile_dir') and os.path.exists(self.profile_dir):
+            try:
+                shutil.rmtree(self.profile_dir, ignore_errors=True)
+            except Exception as e:
+                print(f"[Agent {self.session_id}] Error cleaning profile dir: {e}")
 
 
 # ── Agent pool ────────────────────────────────────────────────────────────────
