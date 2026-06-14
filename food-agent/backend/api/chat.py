@@ -9,7 +9,7 @@ from models.schemas import (
 from services.groq_service import handle_small_talk, generate_confirmation_message
 from services.orchestrator import Orchestrator
 from agents.web_agent import create_agent, get_agent, destroy_agent
-
+import traceback
 router = APIRouter()
 
 @router.post("")
@@ -169,6 +169,8 @@ async def login_phone(req: LoginPhoneRequest):
         result["message"] = "OTP sent to your number!" if result.get("success") else result.get("error")
         return result
     except Exception as e:
+        print("🚨 BROWSER AGENT CRASHED:")
+        traceback.print_exc() # This forces the full error to print to your terminal
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/login/otp")
