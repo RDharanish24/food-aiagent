@@ -5,9 +5,16 @@ import re
 import os
 import json
 import shutil
+import sys
+import asyncio
 from datetime import datetime
 from playwright.async_api import async_playwright, Page, BrowserContext, Browser
 from playwright_stealth import Stealth
+
+# Fix for Windows: Playwright requires ProactorEventLoop for subprocess support.
+# This must be set before any event loop is created (including by uvicorn).
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 BASE_URL = 'https://www.swiggy.com'
 
@@ -38,34 +45,85 @@ class FoodOrderingAgent:
         self.profile_dir = os.path.join(os.getcwd(), f"tmp_playwright_profile_{self.session_id}")
         os.makedirs(self.profile_dir, exist_ok=True)
         
-        # Launch persistent context for stealth and session retention
-        self.context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=self.profile_dir,
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
+        # ── STRATEGY: Launch Chrome as a NORMAL process, then connect via CDP ──
+        # Playwright's built-in launcher adds automation markers (--enable-automation,
+        # modified TLS fingerprint, etc.) that Swiggy's bot detection catches.
+        # By launching Chrome ourselves via subprocess and connecting via CDP,
+        # the browser is 100% identical to a user-launched Chrome.
+        
+        chrome_path = self._find_chrome()
+        self._debug_port = self._find_free_port()
+        
+        self.log('init', 'chrome_path', chrome_path)
+        self.log('init', 'debug_port', str(self._debug_port))
+        
+        # Launch Chrome as a regular process — NO automation flags
+        import subprocess
+        self._chrome_process = subprocess.Popen(
+            [
+                chrome_path,
+                f'--remote-debugging-port={self._debug_port}',
+                f'--user-data-dir={self.profile_dir}',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--disable-popup-blocking',
                 '--window-size=1920,1080',
             ],
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            viewport={'width': 1920, 'height': 1080},
-            locale='en-IN',
-            timezone_id='Asia/Kolkata',
-            permissions=['geolocation'],
-            geolocation={'latitude': float(DEFAULT_LAT), 'longitude': float(DEFAULT_LNG)},
-            color_scheme='light'
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
         
-        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+        # Wait for Chrome to start and the debug port to become available
+        import time as _time
+        for attempt in range(30):
+            try:
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                result = sock.connect_ex(('127.0.0.1', self._debug_port))
+                sock.close()
+                if result == 0:
+                    self.log('init', 'chrome_ready', f'Debug port ready after {attempt * 0.5}s')
+                    break
+            except:
+                pass
+            _time.sleep(0.5)
+        else:
+            raise RuntimeError(f"Chrome failed to start on debug port {self._debug_port}")
         
-        # Apply playwright-stealth to evade bot detection
-        await Stealth().apply_stealth_async(self.page)
+        # Connect to Chrome via CDP (Chrome DevTools Protocol)
+        self._browser = await self._playwright.chromium.connect_over_cdp(
+            f'http://127.0.0.1:{self._debug_port}'
+        )
+        
+        # Get the default context and page
+        self.context = self._browser.contexts[0]
+        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         
         # Set location cookies so Swiggy knows our delivery area
         await self._set_location_cookies(DEFAULT_LAT, DEFAULT_LNG, DEFAULT_ADDRESS)
 
-        self.log('init', 'browser', 'stealth persistent context initialized')
+        self.log('init', 'browser', 'Chrome launched via CDP — zero automation markers')
+    
+    @staticmethod
+    def _find_chrome() -> str:
+        """Find Chrome executable on the system."""
+        possible_paths = [
+            os.path.join(os.environ.get('PROGRAMFILES', ''), 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            os.path.join(os.environ.get('PROGRAMFILES(X86)', ''), 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        ]
+        for p in possible_paths:
+            if os.path.exists(p):
+                return p
+        raise FileNotFoundError("Chrome not found. Please install Google Chrome.")
+    
+    @staticmethod
+    def _find_free_port() -> int:
+        """Find a free port for Chrome's remote debugging."""
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
 
     # ─────────────────────────────────────────────────────────────────────────
     # BROWSER EXECUTION WORKER: SINGLE ENTRY POINT
@@ -693,13 +751,64 @@ class FoodOrderingAgent:
         try:
             self.log('login', 'navigating to swiggy', 'start')
             await self.page.goto(BASE_URL, wait_until='domcontentloaded', timeout=40000)
-            await self.page.wait_for_timeout(3000)
+            await self.page.wait_for_timeout(5000)
+            
+            # Debug: Log page state
+            current_url = self.page.url
+            page_title = await self.page.title()
+            self.log('login', 'page_state', f'URL: {current_url} | Title: {page_title}')
+            
+            # Debug: Save screenshot to disk for inspection
+            try:
+                debug_path = os.path.join(os.getcwd(), 'debug_login_step1.png')
+                await self.page.screenshot(path=debug_path, full_page=True)
+                self.log('login', 'debug_screenshot', f'Saved to {debug_path}')
+            except Exception as ss_err:
+                self.log('login', 'debug_screenshot_err', str(ss_err))
+            
+            # Debug: Log visible text (first 500 chars)
+            try:
+                body_text = await self.page.evaluate('() => document.body?.innerText?.substring(0, 500) || "EMPTY"')
+                self.log('login', 'page_text', body_text[:300])
+            except:
+                pass
+
             screenshot = await self.take_screenshot()
 
             sign_in_clicked = await self._click_sign_in()
+            self.log('login', 'sign_in_clicked', str(sign_in_clicked))
+            
             if not sign_in_clicked:
+                self.log('login', 'fallback', 'Navigating directly to /login')
                 await self.page.goto(f"{BASE_URL}/login", wait_until='domcontentloaded', timeout=20000)
-                await self.page.wait_for_timeout(2000)
+                await self.page.wait_for_timeout(3000)
+                
+                # Debug: Log state after /login navigation
+                current_url = self.page.url
+                page_title = await self.page.title()
+                self.log('login', 'login_page_state', f'URL: {current_url} | Title: {page_title}')
+
+            # Debug: Save screenshot after sign-in click/navigation
+            try:
+                debug_path2 = os.path.join(os.getcwd(), 'debug_login_step2.png')
+                await self.page.screenshot(path=debug_path2, full_page=True)
+                self.log('login', 'debug_screenshot2', f'Saved to {debug_path2}')
+            except:
+                pass
+            
+            # Debug: List all input elements on page
+            try:
+                inputs_info = await self.page.evaluate('''() => {
+                    const inputs = document.querySelectorAll('input');
+                    return Array.from(inputs).map(i => ({
+                        type: i.type, name: i.name, placeholder: i.placeholder,
+                        maxLength: i.maxLength, visible: i.offsetParent !== null,
+                        id: i.id, className: i.className.substring(0, 80)
+                    }));
+                }''')
+                self.log('login', 'inputs_found', json.dumps(inputs_info, indent=2))
+            except Exception as e:
+                self.log('login', 'inputs_error', str(e))
 
             phone_input = await self._wait_for_phone_input()
             if not phone_input:
@@ -850,10 +959,23 @@ class FoodOrderingAgent:
             return None
 
     async def close(self):
-        if self.context:
-            await self.context.close()
+        try:
+            if hasattr(self, '_browser') and self._browser:
+                await self._browser.close()
+        except:
+            pass
         if self._playwright:
             await self._playwright.stop()
+        # Kill the Chrome subprocess
+        if hasattr(self, '_chrome_process') and self._chrome_process:
+            try:
+                self._chrome_process.terminate()
+                self._chrome_process.wait(timeout=5)
+            except:
+                try:
+                    self._chrome_process.kill()
+                except:
+                    pass
         # Clean up persistent profile directory
         if hasattr(self, 'profile_dir') and os.path.exists(self.profile_dir):
             try:
